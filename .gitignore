@@ -1,0 +1,6 @@
+# Ignore local environment variables and secrets
+.env
+
+# Ignore auto-generated Python cache directories
+__pycache__/
+*.py[cod]
