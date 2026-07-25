@@ -1,0 +1,239 @@
+import json
+from planning_agent import planner_agent, executor_agent
+import re
+
+# defining constants for the number of iterations for the two loops in the workflow
+MAX_RESEARCH_LOOPS = 1
+MAX_REVISION_LOOPS = 2
+
+def build_source_registry(all_tool_results: list[dict]) -> tuple[str, dict]:
+    """
+    A function to take raw results from arxiv/tavily/semantic_scholar tools and 
+    return a registry of all the sources that were used in the research.
+
+    Arguments:
+        all_tool_results (list[dict]): A list of dictionary containing the sources gathered using all tools -> (tavily, arxiv, wikipedia, semantic scholar)
+
+    Returns:
+        formatted (str): A string containing information about all sources gathered, formatted.
+        registry (dict): A dictionary of all sources and their corresponding information.
+    """
+    registry = {}
+    formatted = []
+    # Looping through all sources used to "tag" them and add their information to the registry
+    for i, source in enumerate(all_tool_results, 1):
+        tag = f"S{i}"
+        authors = source.get("authors", [])
+        registry[tag] = {
+            "title": source.get("title", ""),
+            "url": source.get("url", ""),
+            "authors": authors,            
+            "year": source.get("year", "")
+        }
+        author_str = ", ".join(authors) if authors else None
+        formatted.append(f"[{tag}] {registry[tag]["title"]} - {author_str} ({registry[tag]["year"]}) - {registry[tag]["url"]}")
+    return "\n".join(formatted), registry
+
+def append_references_section(draft: str, registry: dict) -> str:
+    """
+    A function to scan the writer's draft for citation tags like [S1], [S12], etc.,
+    which appends a references section built directly from the registry of sources created using the build_source_registry_function.
+
+    Arguments:
+        draft (str): The draft written by the writer agent.
+        registry (dict): input from the build_source_registry function whichis used to look for the citations placed in the draft
+
+    Returns:
+        draft + refs (str): The draft with the updated citations
+    """
+
+    # Finding all locations where in text citations have been made.
+    used_tags = set(re.findall(r'\[S\d+\]', draft))
+
+    if not used_tags:
+        return draft  # writer didn't cite anything — nothing to append
+
+    # matching the in-text citation number with the registry to log it in the references
+    refs = "\n\n## References\n\n"
+    for tag in sorted(used_tags, key=lambda t: int(t[2:-1])):
+        tag_clean = tag.strip("[]")
+        src = registry.get(tag_clean)
+        if src:
+            author_str = ", ".join(src["authors"]) if src["authors"] else "Unknown"
+            refs += f"- {tag} {src['title']} — {author_str} ({src['year']}). {src['url']}\n"
+
+    return draft + refs
+
+def last_writer_draft(history):
+    """
+    A function to find the last written draft in case of the LLM failing to provide feedback or 
+    the maximum number of refinement iterations being exceeded.
+
+    Arguments:
+        history (list): A log of all the commands that have been performed. Contains information about the agent and the description of the task it performed.
+    
+    Returns:
+        output (str): The last written draft produced by the writer agent.
+    """
+    for desc, agent, output in reversed(history):
+        if agent == "writer_agent":
+            return output
+    return "No draft was produced"
+
+def _index_of_writer_step(plan):
+    """
+    A function to find the index of the writer step which will later be updated 
+    when executing the writer-editor loop so that the number of planned steps in the workflow remain the same.
+
+    Arguments:
+        plan (list): A list of ordered commands that the workflow has to perform to execute research on the task provided to it.        
+    Returns:
+        idx (int): The index of the writer step.
+    """
+    
+    for idx, step in enumerate(plan):
+        if "writer_agent" in step.lower():
+            return idx
+    return len(plan) - 2
+
+def _index_of_editor_steps(plan):
+    """
+    A function to find the index of the editor step which will later be updated 
+    when executing the writer-editor loop so that the number of planned steps in the workflow remain the same.
+
+    Arguments:
+        plan (list): A list of ordered commands that the workflow has to perform to execute research on the task provided to it.        
+    Returns:
+        idx (int): The index of the editor step.
+        """
+    for idx, step in enumerate(plan):
+        if "editor_agent" in step.lower():
+            return idx
+    return len(plan) - 1
+
+def run_pipeline(topic: str):
+    """
+    A function to run the research agentic workflow pipeline from end to end.
+
+    Arguments:
+        topic: The topic to be researched on as input by the user.
+    
+    Returns:
+        last_writer_draft(history) (str): The final draft of the research report as generated by rigorous research and feedback on both research and writing quality.
+    """
+
+    # defining the history and sources variables to keep appending to as the workflow is run
+    history = []
+    all_sources = []
+
+    plan = planner_agent(topic)
+    print(f"Plan generated with {len(plan)} steps")
+
+    # defining counter variables for the internal loops in the workflow
+    research_loop_count = 0
+    revision_loop_count = 0
+
+    registry = {}
+
+    i = 0
+
+    while i < len(plan):
+        step_title = plan[i]
+
+        # checking for the writer agent step so that the source information can be added as special context
+        if "writer" in step_title.lower() or "draft" in step_title.lower():
+            source_context, registry = build_source_registry(all_sources)
+            writer_prompt = f"{topic}\n\n## Available Sources (cite using these exact tags):\n{source_context}"
+            step_title, agent_name, content, sources = executor_agent(step_title, history, topic, source_context=writer_prompt, step_index=i)
+            content = append_references_section(content, registry)
+        
+        # calling the executor agent for all other agents as well
+        else:
+            step_title, agent_name, content, sources = executor_agent(step_title, history, topic, step_index=i)
+
+        history.append((step_title, agent_name, content))
+        all_sources.extend(sources)
+
+        # implementing the editor-writer loop through which
+        # the editor provides the writer with feedback after analyzing the draft and the writer improves on it
+        if agent_name == "editor_agent":
+            # extracting th editor's feedback as it would be wrapped in a JSON structure
+            try:
+                edit_result = json.loads(content)
+            except json.JSONDecodeError:
+                print("Editor returned malformed JSON - shipping last draft as fallback")
+                return last_writer_draft(history)
+
+            # extracting the status of the draft - approved, needs_more_research or needs_revision
+            status = edit_result.get("status", "").lower()
+
+            readable_content = edit_result.get("feedback", "") if status != "approved" else "Draft approved with no further changes needed"
+            history[-1] = (step_title, agent_name, readable_content)
+
+            # sending the report through if approved
+            if status == "approved":
+                return edit_result["final_report"]
+
+            # calling the researcher agent again with more context on where research is needed
+            # if the editor decides that more research is required
+            elif status == "needs_more_research" and research_loop_count < MAX_RESEARCH_LOOPS:
+                research_loop_count += 1
+                gaps = edit_result.get("research_gaps", [])
+                gap_prompt = f"Focus additional research specifically on these gaps: {gaps}"
+
+                # rerouting to the research step where the LLM has the freedom to call any tool it wants
+                research_step_index = 2
+                step_title, agent_name, content, sources = executor_agent(
+                    "Research agent: address specific evidence gaps flagged by editor",
+                    history,
+                    gap_prompt,
+                    step_index=research_step_index
+                )
+                history.append((step_title, agent_name, content))
+                all_sources.extend(sources)
+
+                i = _index_of_writer_step(plan)
+                continue
+
+            # calling the writer agent again with context on how to improve the draft
+            # if the editor decides that more research is required
+            elif status == "needs_revision" and revision_loop_count < MAX_REVISION_LOOPS:
+                revision_loop_count += 1
+                feedback = edit_result.get("feedback", "")
+
+                i = _index_of_editor_steps(plan)
+
+                step_title, agent_name, content, sources = executor_agent(
+                    "Writer agent: revise draft based on editor feedback",
+                    history,
+                    f"Feedback: Revise the previous draft on this feedback: \n{feedback}",
+                    step_index=i
+                )
+                content = append_references_section(content, registry)
+                history.append((step_title, agent_name, content))
+                all_sources.extend(sources)
+                continue
+
+            else:
+                # Handling the case in which the loop has reached its limit
+                print(f"Loop cap reached or unhandled status: {status}. Shipping last draft.")
+                return last_writer_draft(history)
+
+        i += 1
+
+    return last_writer_draft(history)
+
+def main():
+    topic = input("Enter research topic: ")
+    result = run_pipeline(topic)
+    
+    # Saving the report as a markdown file
+    with open ("research.md", "w") as f:
+        f.write(result)
+        print("Success.")
+
+if __name__ == "__main__":
+    main()
+
+    
+
